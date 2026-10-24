@@ -20,6 +20,7 @@ app.use(
           "'self'",
           "'unsafe-inline'",
           "https://cdnjs.cloudflare.com",
+          "https://cdn.tailwindcss.com",
         ],
         styleSrc: [
           "'self'",

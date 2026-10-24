@@ -1534,6 +1534,13 @@ app.get("/", (req, res) => {
 });
 
 // Admin Route Host - Serves Admin Interface Layout
+
+// Serve Admin Portal JavaScript
+app.get("/admin.js", (req, res) => {
+  res.type("application/javascript");
+  res.sendFile(path.join(__dirname, "admin.js"));
+});
+
 app.get("/admin", (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!DOCTYPE html>

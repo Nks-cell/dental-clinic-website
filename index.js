@@ -1,4 +1,3 @@
-
 const express = require("express");
 const mongoose = require("mongoose");
 const jwt = require("jsonwebtoken");
@@ -21,6 +20,7 @@ app.use(
           "'self'",
           "'unsafe-inline'",
           "https://cdnjs.cloudflare.com",
+          "https://cdn.tailwindcss.com",
         ],
         styleSrc: [
           "'self'",
@@ -74,16 +74,34 @@ const bookingLimiter = rateLimit({
 
 app.use("/api/", generalLimiter);
 
+const USE_MEMORY_STORE = !process.env.MONGODB_URI;
+const memoryBookings = [];
+
+function sanitizeBookingDocument(booking) {
+  const safe = booking.toObject ? booking.toObject() : { ...booking };
+  return {
+    ...safe,
+    _id: safe._id ? String(safe._id) : safe._id,
+    createdAt: safe.createdAt ? new Date(safe.createdAt) : new Date(),
+  };
+}
+
 // Database Connection Caching for Serverless Execution
 let cachedDb = null;
 async function connectToDatabase() {
+  if (USE_MEMORY_STORE) {
+    return null;
+  }
+
   if (cachedDb && mongoose.connection.readyState === 1) {
     return cachedDb;
   }
+
   const mongoUri = process.env.MONGODB_URI;
   if (!mongoUri) {
     throw new Error("MONGODB_URI is not defined in environment variables.");
   }
+
   cachedDb = await mongoose.connect(mongoUri, {
     bufferCommands: false,
     serverSelectionTimeoutMS: 5000,
@@ -93,6 +111,10 @@ async function connectToDatabase() {
 
 // Ensure DB middleware for API routes
 app.use("/api", async (req, res, next) => {
+  if (USE_MEMORY_STORE) {
+    return next();
+  }
+
   try {
     await connectToDatabase();
     next();
@@ -314,8 +336,11 @@ app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
     timestamp: new Date().toISOString(),
-    database:
-      mongoose.connection.readyState === 1 ? "connected" : "disconnected",
+    database: USE_MEMORY_STORE
+      ? "demo-memory"
+      : mongoose.connection.readyState === 1
+        ? "connected"
+        : "disconnected",
   });
 });
 
@@ -353,6 +378,20 @@ app.get("/api/availability", async (req, res) => {
         availableSlots: [],
         reason: "Cannot book appointments for past dates",
       });
+    }
+
+    if (USE_MEMORY_STORE) {
+      const existingBookings = memoryBookings.filter(
+        (booking) =>
+          booking.dentistId === dentistId &&
+          booking.date === date &&
+          booking.status !== "Cancelled",
+      );
+      const bookedSlots = existingBookings.map((b) => b.timeSlot);
+      const availableSlots = TIME_SLOTS.filter(
+        (slot) => !bookedSlots.includes(slot),
+      );
+      return res.json({ availableSlots, bookedSlots });
     }
 
     // Find existing non-cancelled bookings
@@ -431,6 +470,57 @@ app.post("/api/bookings", bookingLimiter, async (req, res) => {
         .json({ error: "Cannot book appointments in the past" });
     }
 
+    if (USE_MEMORY_STORE) {
+      const existing = memoryBookings.find(
+        (booking) =>
+          booking.dentistId === dentistId &&
+          booking.date === date &&
+          booking.timeSlot === timeSlot &&
+          booking.status !== "Cancelled",
+      );
+
+      if (existing) {
+        return res.status(409).json({
+          error:
+            "This time slot is no longer available. Please select another slot.",
+        });
+      }
+
+      const reference = generateBookingRef();
+      const booking = {
+        _id: `mem_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+        reference,
+        fullName: fullName.trim(),
+        phone: phone.trim(),
+        email: email.trim().toLowerCase(),
+        serviceId,
+        serviceName: service.name,
+        dentistId,
+        dentistName: dentist.name,
+        date,
+        timeSlot,
+        reason: (reason || "").trim(),
+        status: "Pending",
+        createdAt: new Date(),
+      };
+
+      memoryBookings.unshift(booking);
+
+      return res.status(201).json({
+        success: true,
+        message: "Booking request submitted successfully",
+        booking: {
+          reference: booking.reference,
+          fullName: booking.fullName,
+          serviceName: booking.serviceName,
+          dentistName: booking.dentistName,
+          date: booking.date,
+          timeSlot: booking.timeSlot,
+          status: booking.status,
+        },
+      });
+    }
+
     // Double-booking check
     const existing = await Booking.findOne({
       dentistId,
@@ -491,6 +581,27 @@ app.get("/api/bookings/status", async (req, res) => {
     const { reference } = req.query;
     if (!reference) {
       return res.status(400).json({ error: "Booking reference is required" });
+    }
+
+    if (USE_MEMORY_STORE) {
+      const booking = memoryBookings.find(
+        (entry) => entry.reference === reference.trim().toUpperCase(),
+      );
+      if (!booking) {
+        return res
+          .status(404)
+          .json({ error: "No booking found with this reference code" });
+      }
+
+      return res.json({
+        reference: booking.reference,
+        serviceName: booking.serviceName,
+        dentistName: booking.dentistName,
+        date: booking.date,
+        timeSlot: booking.timeSlot,
+        status: booking.status,
+        createdAt: booking.createdAt,
+      });
     }
 
     const booking = await Booking.findOne({
@@ -577,6 +688,33 @@ app.get("/api/admin/me", authenticateAdmin, (req, res) => {
 app.get("/api/admin/dashboard", authenticateAdmin, async (req, res) => {
   try {
     const today = getTodayIST();
+
+    if (USE_MEMORY_STORE) {
+      const totalBookings = memoryBookings.length;
+      const pendingCount = memoryBookings.filter(
+        (booking) => booking.status === "Pending",
+      ).length;
+      const confirmedCount = memoryBookings.filter(
+        (booking) => booking.status === "Confirmed",
+      ).length;
+      const completedCount = memoryBookings.filter(
+        (booking) => booking.status === "Completed",
+      ).length;
+      const todayCount = memoryBookings.filter(
+        (booking) => booking.date === today,
+      ).length;
+
+      return res.json({
+        metrics: {
+          total: totalBookings,
+          pending: pendingCount,
+          confirmed: confirmedCount,
+          completed: completedCount,
+          today: todayCount,
+        },
+      });
+    }
+
     const totalBookings = await Booking.countDocuments();
     const pendingCount = await Booking.countDocuments({ status: "Pending" });
     const confirmedCount = await Booking.countDocuments({
@@ -601,9 +739,63 @@ app.get("/api/admin/dashboard", authenticateAdmin, async (req, res) => {
   }
 });
 
-app.get("/api/admin/bookings", authenticateAdmin, async (req, res) => {
+async function listAdminBookings(req, res) {
   try {
     const { search, status, date, page = 1, limit = 10 } = req.query;
+
+    if (USE_MEMORY_STORE) {
+      const searchTerm = (search || "").trim().toLowerCase();
+      let filteredBookings = [...memoryBookings];
+
+      if (status && status !== "All") {
+        filteredBookings = filteredBookings.filter(
+          (booking) => booking.status === status,
+        );
+      }
+
+      if (date) {
+        filteredBookings = filteredBookings.filter(
+          (booking) => booking.date === date,
+        );
+      }
+
+      if (searchTerm) {
+        filteredBookings = filteredBookings.filter((booking) => {
+          const fields = [
+            booking.reference,
+            booking.fullName,
+            booking.phone,
+            booking.email,
+            booking.serviceName,
+            booking.dentistName,
+          ]
+            .filter(Boolean)
+            .map((value) => String(value).toLowerCase());
+          return fields.some((value) => value.includes(searchTerm));
+        });
+      }
+
+      filteredBookings.sort(
+        (a, b) => new Date(b.createdAt) - new Date(a.createdAt),
+      );
+
+      const pageNum = parseInt(page, 10) || 1;
+      const limitNum = parseInt(limit, 10) || 10;
+      const total = filteredBookings.length;
+      const skip = (pageNum - 1) * limitNum;
+      const bookings = filteredBookings.slice(skip, skip + limitNum);
+
+      return res.json({
+        bookings,
+        pagination: {
+          total,
+          page: pageNum,
+          pages: Math.max(1, Math.ceil(total / limitNum) || 1),
+          limit: limitNum,
+        },
+      });
+    }
+
     let query = {};
 
     if (status && status !== "All") {
@@ -648,47 +840,74 @@ app.get("/api/admin/bookings", authenticateAdmin, async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: "Failed to fetch bookings" });
   }
-});
+}
+
+async function updateAdminBookingStatus(req, res) {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    if (
+      !["Pending", "Confirmed", "Completed", "Cancelled", "Rejected"].includes(
+        status,
+      )
+    ) {
+      return res.status(400).json({ error: "Invalid status value" });
+    }
+
+    if (USE_MEMORY_STORE) {
+      const bookingIndex = memoryBookings.findIndex(
+        (booking) => booking._id === id,
+      );
+      if (bookingIndex === -1) {
+        return res.status(404).json({ error: "Booking not found" });
+      }
+
+      memoryBookings[bookingIndex] = {
+        ...memoryBookings[bookingIndex],
+        status,
+      };
+
+      return res.json({
+        success: true,
+        booking: memoryBookings[bookingIndex],
+        notificationNotice:
+          "Status updated. External email/WhatsApp notifications are disabled (no external provider API configured).",
+      });
+    }
+
+    const booking = await Booking.findByIdAndUpdate(
+      id,
+      { status },
+      { new: true },
+    );
+    if (!booking) {
+      return res.status(404).json({ error: "Booking not found" });
+    }
+
+    res.json({
+      success: true,
+      booking,
+      notificationNotice:
+        "Status updated. External email/WhatsApp notifications are disabled (no external provider API configured).",
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to update booking status" });
+  }
+}
+
+app.get("/api/admin/bookings", authenticateAdmin, listAdminBookings);
+app.get("/api/admin/appointments", authenticateAdmin, listAdminBookings);
 
 app.patch(
   "/api/admin/bookings/:id/status",
   authenticateAdmin,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-      const { status } = req.body;
-
-      if (
-        ![
-          "Pending",
-          "Confirmed",
-          "Completed",
-          "Cancelled",
-          "Rejected",
-        ].includes(status)
-      ) {
-        return res.status(400).json({ error: "Invalid status value" });
-      }
-
-      const booking = await Booking.findByIdAndUpdate(
-        id,
-        { status },
-        { new: true },
-      );
-      if (!booking) {
-        return res.status(404).json({ error: "Booking not found" });
-      }
-
-      res.json({
-        success: true,
-        booking,
-        notificationNotice:
-          "Status updated. External email/WhatsApp notifications are disabled (no external provider API configured).",
-      });
-    } catch (err) {
-      res.status(500).json({ error: "Failed to update booking status" });
-    }
-  },
+  updateAdminBookingStatus,
+);
+app.patch(
+  "/api/admin/appointments/:id/status",
+  authenticateAdmin,
+  updateAdminBookingStatus,
 );
 
 app.patch(
@@ -703,6 +922,43 @@ app.patch(
         return res
           .status(400)
           .json({ error: "Date and time slot are required for rescheduling" });
+      }
+
+      if (USE_MEMORY_STORE) {
+        const bookingIndex = memoryBookings.findIndex(
+          (booking) => booking._id === id,
+        );
+        if (bookingIndex === -1) {
+          return res.status(404).json({ error: "Booking not found" });
+        }
+
+        const currentBooking = memoryBookings[bookingIndex];
+        const conflict = memoryBookings.find(
+          (booking) =>
+            booking._id !== id &&
+            booking.dentistId === currentBooking.dentistId &&
+            booking.date === date &&
+            booking.timeSlot === timeSlot &&
+            booking.status !== "Cancelled",
+        );
+
+        if (conflict) {
+          return res.status(409).json({
+            error: "The selected slot is already booked for this dentist.",
+          });
+        }
+
+        memoryBookings[bookingIndex] = {
+          ...currentBooking,
+          date,
+          timeSlot,
+        };
+
+        return res.json({
+          success: true,
+          booking: memoryBookings[bookingIndex],
+          message: "Appointment rescheduled successfully",
+        });
       }
 
       const currentBooking = await Booking.findById(id);
@@ -740,21 +996,7 @@ app.patch(
   },
 );
 
-// Serve the admin frontend at /admin.js (required by /admin page).
-// Disable caching so Vercel/browser cannot keep an older endpoint version.
-app.get("/admin.js", (req, res) => {
-  const adminPath = path.join(__dirname, "admin.js");
-  res.setHeader("Content-Type", "application/javascript; charset=utf-8");
-  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-  res.setHeader("Pragma", "no-cache");
-  res.setHeader("Expires", "0");
-  if (!fs.existsSync(adminPath)) {
-    return res.status(404).send('console.error("admin.js file not found on server");');
-  }
-  return res.sendFile(adminPath);
-});
-
-// Legacy fallback: serve admin.js via /?serveFile=admin.js as well.
+// Serve admin.js frontend script if requested via query or endpoint
 app.get("/", (req, res) => {
   if (req.query.serveFile === "admin.js") {
     const adminPath = path.join(__dirname, "admin.js");
@@ -1548,16 +1790,22 @@ app.get("/", (req, res) => {
 });
 
 // Admin Route Host - Serves Admin Interface Layout
+
+// Serve Admin Portal JavaScript
+app.get("/admin.js", (req, res) => {
+  res.type("application/javascript");
+  res.sendFile(path.join(__dirname, "admin.js"));
+});
+
 app.get("/admin", (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
   res.send(`<!DOCTYPE html>
 <html lang="en" class="scroll-smooth">
+<script src="https://cdn.tailwindcss.com"></script>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Admin Dashboard | DentalCare Studio</title>
-    <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <style>

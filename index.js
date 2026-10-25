@@ -74,16 +74,34 @@ const bookingLimiter = rateLimit({
 
 app.use("/api/", generalLimiter);
 
+const USE_MEMORY_STORE = !process.env.MONGODB_URI;
+const memoryBookings = [];
+
+function sanitizeBookingDocument(booking) {
+  const safe = booking.toObject ? booking.toObject() : { ...booking };
+  return {
+    ...safe,
+    _id: safe._id ? String(safe._id) : safe._id,
+    createdAt: safe.createdAt ? new Date(safe.createdAt) : new Date(),
+  };
+}
+
 // Database Connection Caching for Serverless Execution
 let cachedDb = null;
 async function connectToDatabase() {
+  if (USE_MEMORY_STORE) {
+    return null;
+  }
+
   if (cachedDb && mongoose.connection.readyState === 1) {
     return cachedDb;
   }
+
   const mongoUri = process.env.MONGODB_URI;
   if (!mongoUri) {
     throw new Error("MONGODB_URI is not defined in environment variables.");
   }
+
   cachedDb = await mongoose.connect(mongoUri, {
     bufferCommands: false,
     serverSelectionTimeoutMS: 5000,
@@ -93,6 +111,10 @@ async function connectToDatabase() {
 
 // Ensure DB middleware for API routes
 app.use("/api", async (req, res, next) => {
+  if (USE_MEMORY_STORE) {
+    return next();
+  }
+
   try {
     await connectToDatabase();
     next();
@@ -314,8 +336,11 @@ app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
     timestamp: new Date().toISOString(),
-    database:
-      mongoose.connection.readyState === 1 ? "connected" : "disconnected",
+    database: USE_MEMORY_STORE
+      ? "demo-memory"
+      : mongoose.connection.readyState === 1
+        ? "connected"
+        : "disconnected",
   });
 });
 
@@ -353,6 +378,20 @@ app.get("/api/availability", async (req, res) => {
         availableSlots: [],
         reason: "Cannot book appointments for past dates",
       });
+    }
+
+    if (USE_MEMORY_STORE) {
+      const existingBookings = memoryBookings.filter(
+        (booking) =>
+          booking.dentistId === dentistId &&
+          booking.date === date &&
+          booking.status !== "Cancelled",
+      );
+      const bookedSlots = existingBookings.map((b) => b.timeSlot);
+      const availableSlots = TIME_SLOTS.filter(
+        (slot) => !bookedSlots.includes(slot),
+      );
+      return res.json({ availableSlots, bookedSlots });
     }
 
     // Find existing non-cancelled bookings
@@ -431,6 +470,57 @@ app.post("/api/bookings", bookingLimiter, async (req, res) => {
         .json({ error: "Cannot book appointments in the past" });
     }
 
+    if (USE_MEMORY_STORE) {
+      const existing = memoryBookings.find(
+        (booking) =>
+          booking.dentistId === dentistId &&
+          booking.date === date &&
+          booking.timeSlot === timeSlot &&
+          booking.status !== "Cancelled",
+      );
+
+      if (existing) {
+        return res.status(409).json({
+          error:
+            "This time slot is no longer available. Please select another slot.",
+        });
+      }
+
+      const reference = generateBookingRef();
+      const booking = {
+        _id: `mem_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+        reference,
+        fullName: fullName.trim(),
+        phone: phone.trim(),
+        email: email.trim().toLowerCase(),
+        serviceId,
+        serviceName: service.name,
+        dentistId,
+        dentistName: dentist.name,
+        date,
+        timeSlot,
+        reason: (reason || "").trim(),
+        status: "Pending",
+        createdAt: new Date(),
+      };
+
+      memoryBookings.unshift(booking);
+
+      return res.status(201).json({
+        success: true,
+        message: "Booking request submitted successfully",
+        booking: {
+          reference: booking.reference,
+          fullName: booking.fullName,
+          serviceName: booking.serviceName,
+          dentistName: booking.dentistName,
+          date: booking.date,
+          timeSlot: booking.timeSlot,
+          status: booking.status,
+        },
+      });
+    }
+
     // Double-booking check
     const existing = await Booking.findOne({
       dentistId,
@@ -491,6 +581,27 @@ app.get("/api/bookings/status", async (req, res) => {
     const { reference } = req.query;
     if (!reference) {
       return res.status(400).json({ error: "Booking reference is required" });
+    }
+
+    if (USE_MEMORY_STORE) {
+      const booking = memoryBookings.find(
+        (entry) => entry.reference === reference.trim().toUpperCase(),
+      );
+      if (!booking) {
+        return res
+          .status(404)
+          .json({ error: "No booking found with this reference code" });
+      }
+
+      return res.json({
+        reference: booking.reference,
+        serviceName: booking.serviceName,
+        dentistName: booking.dentistName,
+        date: booking.date,
+        timeSlot: booking.timeSlot,
+        status: booking.status,
+        createdAt: booking.createdAt,
+      });
     }
 
     const booking = await Booking.findOne({
@@ -577,6 +688,33 @@ app.get("/api/admin/me", authenticateAdmin, (req, res) => {
 app.get("/api/admin/dashboard", authenticateAdmin, async (req, res) => {
   try {
     const today = getTodayIST();
+
+    if (USE_MEMORY_STORE) {
+      const totalBookings = memoryBookings.length;
+      const pendingCount = memoryBookings.filter(
+        (booking) => booking.status === "Pending",
+      ).length;
+      const confirmedCount = memoryBookings.filter(
+        (booking) => booking.status === "Confirmed",
+      ).length;
+      const completedCount = memoryBookings.filter(
+        (booking) => booking.status === "Completed",
+      ).length;
+      const todayCount = memoryBookings.filter(
+        (booking) => booking.date === today,
+      ).length;
+
+      return res.json({
+        metrics: {
+          total: totalBookings,
+          pending: pendingCount,
+          confirmed: confirmedCount,
+          completed: completedCount,
+          today: todayCount,
+        },
+      });
+    }
+
     const totalBookings = await Booking.countDocuments();
     const pendingCount = await Booking.countDocuments({ status: "Pending" });
     const confirmedCount = await Booking.countDocuments({
@@ -604,6 +742,60 @@ app.get("/api/admin/dashboard", authenticateAdmin, async (req, res) => {
 app.get("/api/admin/bookings", authenticateAdmin, async (req, res) => {
   try {
     const { search, status, date, page = 1, limit = 10 } = req.query;
+
+    if (USE_MEMORY_STORE) {
+      const searchTerm = (search || "").trim().toLowerCase();
+      let filteredBookings = [...memoryBookings];
+
+      if (status && status !== "All") {
+        filteredBookings = filteredBookings.filter(
+          (booking) => booking.status === status,
+        );
+      }
+
+      if (date) {
+        filteredBookings = filteredBookings.filter(
+          (booking) => booking.date === date,
+        );
+      }
+
+      if (searchTerm) {
+        filteredBookings = filteredBookings.filter((booking) => {
+          const fields = [
+            booking.reference,
+            booking.fullName,
+            booking.phone,
+            booking.email,
+            booking.serviceName,
+            booking.dentistName,
+          ]
+            .filter(Boolean)
+            .map((value) => String(value).toLowerCase());
+          return fields.some((value) => value.includes(searchTerm));
+        });
+      }
+
+      filteredBookings.sort(
+        (a, b) => new Date(b.createdAt) - new Date(a.createdAt),
+      );
+
+      const pageNum = parseInt(page, 10) || 1;
+      const limitNum = parseInt(limit, 10) || 10;
+      const total = filteredBookings.length;
+      const skip = (pageNum - 1) * limitNum;
+      const bookings = filteredBookings.slice(skip, skip + limitNum);
+
+      return res.json({
+        bookings,
+        pagination: {
+          total,
+          page: pageNum,
+          pages: Math.max(1, Math.ceil(total / limitNum) || 1),
+          limit: limitNum,
+        },
+      });
+    }
+
     let query = {};
 
     if (status && status !== "All") {
@@ -670,6 +862,27 @@ app.patch(
         return res.status(400).json({ error: "Invalid status value" });
       }
 
+      if (USE_MEMORY_STORE) {
+        const bookingIndex = memoryBookings.findIndex(
+          (booking) => booking._id === id,
+        );
+        if (bookingIndex === -1) {
+          return res.status(404).json({ error: "Booking not found" });
+        }
+
+        memoryBookings[bookingIndex] = {
+          ...memoryBookings[bookingIndex],
+          status,
+        };
+
+        return res.json({
+          success: true,
+          booking: memoryBookings[bookingIndex],
+          notificationNotice:
+            "Status updated. External email/WhatsApp notifications are disabled (no external provider API configured).",
+        });
+      }
+
       const booking = await Booking.findByIdAndUpdate(
         id,
         { status },
@@ -703,6 +916,43 @@ app.patch(
         return res
           .status(400)
           .json({ error: "Date and time slot are required for rescheduling" });
+      }
+
+      if (USE_MEMORY_STORE) {
+        const bookingIndex = memoryBookings.findIndex(
+          (booking) => booking._id === id,
+        );
+        if (bookingIndex === -1) {
+          return res.status(404).json({ error: "Booking not found" });
+        }
+
+        const currentBooking = memoryBookings[bookingIndex];
+        const conflict = memoryBookings.find(
+          (booking) =>
+            booking._id !== id &&
+            booking.dentistId === currentBooking.dentistId &&
+            booking.date === date &&
+            booking.timeSlot === timeSlot &&
+            booking.status !== "Cancelled",
+        );
+
+        if (conflict) {
+          return res.status(409).json({
+            error: "The selected slot is already booked for this dentist.",
+          });
+        }
+
+        memoryBookings[bookingIndex] = {
+          ...currentBooking,
+          date,
+          timeSlot,
+        };
+
+        return res.json({
+          success: true,
+          booking: memoryBookings[bookingIndex],
+          message: "Appointment rescheduled successfully",
+        });
       }
 
       const currentBooking = await Booking.findById(id);
